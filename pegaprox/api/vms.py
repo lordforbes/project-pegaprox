@@ -23,7 +23,7 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth, load_users, validate_session, build_authz_user
+from pegaprox.utils.auth import require_auth, load_users, validate_session, build_authz_user, verify_password
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm, get_user_permissions, get_user_clusters
 
@@ -10552,11 +10552,209 @@ def bulk_migrate_api(cluster_id):
     
     # NS: Push immediate update for live UI (all migrations started)
     push_immediate_update(cluster_id, delay=0.5)
-    
+
     return jsonify({
         'results': results,
         'total': len(vms),
         'successful': sum(1 for r in results if r['success'])
+    })
+
+
+def _qemu_agent_exec(mgr, node, vmid, command, timeout, started_at):
+    """Run `command` inside a QEMU guest via the qemu-guest-agent (no in-guest
+    SSH credentials needed - but the agent must be installed and running).
+    Wraps the command in `/bin/sh -c` so pipes/redirects/&& work as typed."""
+    base = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent"
+    try:
+        resp = mgr._api_post(f"{base}/exec", data={'command': ['/bin/sh', '-c', command]})
+    except Exception as e:
+        return {'vmid': vmid, 'node': node, 'type': 'qemu', 'success': False,
+                'timestamp': started_at, 'stdout': '', 'stderr': f'Could not reach guest agent: {e}'}
+    if resp.status_code != 200:
+        body = resp.text or ''
+        if 'not running' in body.lower() or 'not installed' in body.lower():
+            reason = 'QEMU guest agent is not running/installed'
+        else:
+            reason = body or f'HTTP {resp.status_code}'
+        return {'vmid': vmid, 'node': node, 'type': 'qemu', 'success': False,
+                'timestamp': started_at, 'stdout': '', 'stderr': reason}
+    pid = (resp.json().get('data') or {}).get('pid')
+    if not pid:
+        return {'vmid': vmid, 'node': node, 'type': 'qemu', 'success': False,
+                'timestamp': started_at, 'stdout': '', 'stderr': 'Guest agent did not return a PID'}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st = mgr._api_get(f"{base}/exec-status", params={'pid': pid})
+        except Exception as e:
+            return {'vmid': vmid, 'node': node, 'type': 'qemu', 'success': False,
+                    'timestamp': started_at, 'stdout': '', 'stderr': f'Error polling exec status: {e}'}
+        if st.status_code == 200:
+            sd = st.json().get('data') or {}
+            if sd.get('exited'):
+                return {
+                    'vmid': vmid, 'node': node, 'type': 'qemu',
+                    'success': sd.get('exitcode', 1) == 0,
+                    'exit_code': sd.get('exitcode'),
+                    'timestamp': started_at,
+                    'stdout': (sd.get('out-data') or '')[:20000],
+                    'stderr': (sd.get('err-data') or '')[:20000],
+                }
+        time.sleep(0.5)
+    return {'vmid': vmid, 'node': node, 'type': 'qemu', 'success': False,
+            'timestamp': started_at, 'stdout': '', 'stderr': f'Timed out after {timeout:.0f}s waiting for guest agent'}
+
+
+def _lxc_pct_exec(mgr, node, vmid, command, timeout, started_at):
+    """Run `command` inside an LXC container via `pct exec` over SSH to the
+    container's host node - containers share the host kernel, no in-guest
+    agent needed."""
+    node_ip = mgr._get_node_ip(node)
+    if not node_ip:
+        return {'vmid': vmid, 'node': node, 'type': 'lxc', 'success': False,
+                'timestamp': started_at, 'stdout': '', 'stderr': 'Could not determine SSH-reachable IP for node'}
+    ssh = mgr._ssh_connect(node_ip)
+    if not ssh:
+        return {'vmid': vmid, 'node': node, 'type': 'lxc', 'success': False,
+                'timestamp': started_at, 'stdout': '', 'stderr': 'SSH connection to node failed'}
+    try:
+        remote_cmd = f'pct exec {int(vmid)} -- /bin/sh -c {shlex.quote(command)}'
+        stdin, stdout, stderr = ssh.exec_command(remote_cmd, timeout=timeout)
+        out = stdout.read().decode('utf-8', errors='replace')[:20000]
+        errout = stderr.read().decode('utf-8', errors='replace')[:20000]
+        rc = stdout.channel.recv_exit_status()
+    finally:
+        ssh.close()
+    return {'vmid': vmid, 'node': node, 'type': 'lxc', 'success': rc == 0, 'exit_code': rc,
+            'timestamp': started_at, 'stdout': out, 'stderr': errout}
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/execute', methods=['POST'])
+@require_auth(perms=['admin.scripts'])
+def execute_vm_command(cluster_id):
+    """Run an ad-hoc shell command inside multiple guests (VMs/containers) in
+    parallel - REQUIRES PASSWORD CONFIRMATION. Same shape as
+    execute_cluster_command (nodes.py) and bulk_migrate_api above, just
+    targeting guests instead of hypervisor nodes.
+
+    QEMU guests run the command via the qemu-guest-agent; LXC containers via
+    `pct exec` over SSH to their host node (see helpers above). This is
+    guest-level RCE, so admin.scripts alone isn't enough authorization for a
+    tenant/pool-scoped caller who might hold it via a custom role - every
+    target VM is ALSO gated with user_can_access_vm, mirroring the
+    defense-in-depth bulk_migrate_api already does for vm.migrate.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    data = request.json or {}
+    command = data.get('command')
+    password = data.get('password')
+    vms = data.get('vms', [])  # [{node, vmid, type}]
+
+    if not command or not isinstance(command, str) or not command.strip():
+        return jsonify({'error': 'Command is required'}), 400
+    command = command.strip()
+    if len(command) > 4000:
+        return jsonify({'error': 'Command too long (max 4000 chars)'}), 400
+
+    if not isinstance(vms, list) or not vms:
+        return jsonify({'error': 'No VMs specified'}), 400
+    if len(vms) > 500:
+        return jsonify({'error': 'Too many VMs in one request (max 500). Split into smaller batches.'}), 400
+
+    if not password:
+        return jsonify({'error': 'Password confirmation required to run commands'}), 401
+
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    users = load_users()
+    user_data = users.get(usr)
+    if not user_data:
+        return jsonify({'error': 'User not found'}), 401
+
+    mgr = cluster_managers[cluster_id]
+    cluster_name = mgr.config.name if hasattr(mgr, 'config') else cluster_id
+
+    stored_salt = user_data.get('password_salt', '')
+    stored_hash = user_data.get('password_hash', '')
+    if not stored_salt or not stored_hash or not verify_password(password, stored_salt, stored_hash):
+        log_audit(usr, 'vm.execute_denied', 'Failed password verification for VM command execution', cluster=cluster_name)
+        return jsonify({'error': 'Invalid password'}), 401
+
+    try:
+        node_timeout = float(data.get('timeout', 8))
+    except (TypeError, ValueError):
+        node_timeout = 8.0
+    node_timeout = max(1.0, min(node_timeout, 10.0))
+
+    _authz_user = dict(user_data)
+    _authz_user['username'] = usr
+
+    targets = []
+    results = []
+    for vm in vms:
+        node = vm.get('node')
+        vm_type = vm.get('type', 'qemu')
+        try:
+            vmid = int(vm.get('vmid'))
+        except (TypeError, ValueError):
+            results.append({'vmid': vm.get('vmid'), 'node': node, 'success': False, 'stdout': '', 'stderr': 'Invalid vmid'})
+            continue
+        if not node or not isinstance(node, str) or not _HOST_RE.match(node):
+            results.append({'vmid': vmid, 'node': node, 'success': False, 'stdout': '', 'stderr': 'Invalid node name'})
+            continue
+        if not user_can_access_vm(_authz_user, cluster_id, vmid, 'admin.scripts', vm_type):
+            results.append({'vmid': vmid, 'node': node, 'success': False, 'stdout': '', 'stderr': 'Permission denied: admin.scripts'})
+            continue
+        targets.append((vmid, node, vm_type))
+
+    if not targets:
+        return jsonify({'error': 'No accessible VMs to target', 'results': results}), 403
+
+    log_audit(usr, 'vm.execute_started',
+              f"Starting ad-hoc command on {len(targets)} VMs: {command[:200]}",
+              cluster=cluster_name)
+
+    def _exec_on_vm(key):
+        vmid, node, vm_type = key
+        started_at = datetime.now().isoformat()
+        try:
+            if vm_type == 'qemu':
+                return _qemu_agent_exec(mgr, node, vmid, command, node_timeout, started_at)
+            else:
+                return _lxc_pct_exec(mgr, node, vmid, command, node_timeout, started_at)
+        except Exception as e:
+            return {'vmid': vmid, 'node': node, 'type': vm_type, 'success': False,
+                    'timestamp': started_at, 'stdout': '', 'stderr': str(e)}
+
+    from pegaprox.utils.concurrent import run_per_node
+    raw = run_per_node(
+        {t: _exec_on_vm for t in targets},
+        max_concurrent=8,
+        timeout=node_timeout + 10,
+    )
+
+    for t in targets:
+        vmid, node, vm_type = t
+        r = raw.get(t) or {'vmid': vmid, 'node': node, 'type': vm_type, 'success': False,
+                            'timestamp': datetime.now().isoformat(), 'stdout': '', 'stderr': 'Timed out or no result'}
+        results.append(r)
+
+    success_count = sum(1 for r in results if r.get('success'))
+    status = 'success' if success_count == len(vms) else ('partial' if success_count > 0 else 'failed')
+
+    log_audit(usr, 'vm.executed',
+              f"Ad-hoc VM command completed: {success_count}/{len(vms)} succeeded ({status}): {command[:200]}",
+              cluster=cluster_name)
+
+    return jsonify({
+        'success': success_count == len(vms),
+        'status': status,
+        'message': f'Ran on {success_count}/{len(vms)} VMs',
+        'results': results
     })
 
 

@@ -3657,6 +3657,270 @@
             );
         }
 
+        // VM Command — the ClusterCommandTab idea, but targeting guests instead of
+        // hypervisor nodes: type a command once, run it inside every VM/container,
+        // a pool, or a hand-picked subset. QEMU guests go through the qemu-guest-agent
+        // (no in-guest SSH creds needed); LXC containers go through `pct exec` on the
+        // host (see backend execute_vm_command in api/vms.py). Same admin.scripts +
+        // password-confirmation guardrails as ClusterCommandTab.
+        function VmCommandTab({ clusterId, resources, authFetch, addToast, t }) {
+            const [command, setCommand] = React.useState('');
+            const [mode, setMode] = React.useState('all'); // 'all' | 'pool' | 'manual'
+            const [selectedPool, setSelectedPool] = React.useState('');
+            const [manualIds, setManualIds] = React.useState(() => new Set());
+            const [filterText, setFilterText] = React.useState('');
+            const [running, setRunning] = React.useState(false);
+            const [results, setResults] = React.useState(null);
+            const [status, setStatus] = React.useState(null);
+            const [showPasswordModal, setShowPasswordModal] = React.useState(false);
+
+            const guests = React.useMemo(
+                () => (resources || []).filter(r => r && (r.type === 'qemu' || r.type === 'lxc')),
+                [resources]
+            );
+            const pools = React.useMemo(() => {
+                const s = new Set();
+                guests.forEach(g => { if (g.pool) s.add(g.pool); });
+                return Array.from(s).sort();
+            }, [guests]);
+            const filteredGuests = React.useMemo(() => {
+                const q = filterText.trim().toLowerCase();
+                if (!q) return guests;
+                return guests.filter(g => `${g.name || ''} ${g.vmid}`.toLowerCase().includes(q));
+            }, [guests, filterText]);
+
+            const targets = React.useMemo(() => {
+                if (mode === 'pool') return guests.filter(g => g.pool === selectedPool);
+                if (mode === 'manual') return guests.filter(g => manualIds.has(g.vmid));
+                return guests;
+            }, [mode, guests, selectedPool, manualIds]);
+
+            const toggleManual = (vmid) => {
+                setManualIds(prev => {
+                    const next = new Set(prev);
+                    if (next.has(vmid)) next.delete(vmid); else next.add(vmid);
+                    return next;
+                });
+            };
+
+            const runCommand = async (password) => {
+                if (!targets.length) { addToast(t('noVmsSelected') || 'No VMs selected', 'error'); return; }
+                setRunning(true);
+                setShowPasswordModal(false);
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/vms/execute`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            command,
+                            password,
+                            vms: targets.map(g => ({ node: g.node, vmid: g.vmid, type: g.type })),
+                        }),
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (res && res.ok) {
+                        setResults(data.results || []);
+                        setStatus(data.status || null);
+                        addToast(data.message || (t('commandExecuted') || 'Command executed'), data.success ? 'success' : 'warning');
+                    } else {
+                        addToast(data.error || (t('commandFailed') || 'Failed to execute command'), 'error');
+                        if (data.results) { setResults(data.results); setStatus('failed'); }
+                    }
+                } catch (e) {
+                    addToast('Error: ' + e.message, 'error');
+                } finally {
+                    setRunning(false);
+                }
+            };
+
+            return (
+                <div className="space-y-4">
+                    <p className="text-sm text-gray-400">
+                        {t('vmCommandDesc') || 'Run a one-off shell command inside VMs (via QEMU guest agent) or containers (via pct exec) — all of them, a pool, or a hand-picked selection.'}
+                    </p>
+
+                    <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-yellow-300 text-sm flex items-start gap-2">
+                        <Icons.AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                        <span>{t('vmCommandWarning') || 'QEMU VMs need the guest agent installed and running. Double-check the command and target list before running it.'}</span>
+                    </div>
+
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3">
+                        <label className="block text-sm text-gray-400">{t('command') || 'Command'}</label>
+                        <textarea
+                            value={command}
+                            onChange={(e) => setCommand(e.target.value)}
+                            rows={4}
+                            placeholder="uptime"
+                            spellCheck={false}
+                            className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg font-mono text-sm text-gray-200"
+                        />
+
+                        <label className="block text-sm text-gray-400 mt-2">{t('target') || 'Target'}</label>
+                        <div className="flex flex-wrap items-center gap-2">
+                            {[
+                                { id: 'all', label: t('allVms') || `All VMs & Containers (${guests.length})` },
+                                { id: 'pool', label: t('byPool') || 'By Pool' },
+                                { id: 'manual', label: t('selectVms') || 'Select VMs' },
+                            ].map(opt => (
+                                <button
+                                    key={opt.id}
+                                    onClick={() => setMode(opt.id)}
+                                    className={`px-3 py-1.5 rounded-lg text-sm ${
+                                        mode === opt.id
+                                            ? 'bg-proxmox-orange text-white'
+                                            : 'bg-proxmox-dark text-gray-400 hover:text-white hover:bg-proxmox-hover'
+                                    }`}
+                                >
+                                    {opt.label}
+                                </button>
+                            ))}
+                        </div>
+
+                        {mode === 'pool' && (
+                            <select
+                                value={selectedPool}
+                                onChange={(e) => setSelectedPool(e.target.value)}
+                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-sm"
+                            >
+                                <option value="">{t('choosePool') || 'Choose a pool...'}</option>
+                                {pools.map(p => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                        )}
+
+                        {mode === 'manual' && (
+                            <div className="border border-proxmox-border rounded-lg overflow-hidden">
+                                <input
+                                    value={filterText}
+                                    onChange={(e) => setFilterText(e.target.value)}
+                                    placeholder={t('filterVms') || 'Filter by name or VMID...'}
+                                    className="w-full px-3 py-2 bg-proxmox-dark border-b border-proxmox-border text-sm"
+                                />
+                                <div className="max-h-56 overflow-y-auto divide-y divide-proxmox-border/50">
+                                    {filteredGuests.map(g => (
+                                        <label key={g.vmid} className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-proxmox-hover cursor-pointer">
+                                            <input
+                                                type="checkbox"
+                                                checked={manualIds.has(g.vmid)}
+                                                onChange={() => toggleManual(g.vmid)}
+                                            />
+                                            <span className="text-gray-500 font-mono text-xs w-16">{g.vmid}</span>
+                                            <span className="text-gray-200">{g.name || `${g.type === 'qemu' ? 'VM' : 'CT'} ${g.vmid}`}</span>
+                                            <span className="text-gray-600 text-xs ml-auto">{g.node}</span>
+                                        </label>
+                                    ))}
+                                    {filteredGuests.length === 0 && (
+                                        <p className="text-xs text-gray-600 px-3 py-4 text-center">{t('noVmsFound') || 'No VMs match'}</p>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="flex items-center justify-between pt-1">
+                            <span className="text-xs text-gray-500">
+                                {t('targetsSelected') || 'Targets'}: {targets.length}
+                            </span>
+                            <button
+                                onClick={() => setShowPasswordModal(true)}
+                                disabled={!command.trim() || running || !targets.length}
+                                className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm"
+                            >
+                                {running ? <Icons.RefreshCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
+                                {running ? (t('running') || 'Running...') : (t('executeSelected') || 'Execute on Selected')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {results && (
+                        <div className="space-y-3">
+                            <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-semibold text-gray-300">{t('results') || 'Results'}</h4>
+                                {status && (
+                                    <span className={`text-xs px-2 py-0.5 rounded-full ${
+                                        status === 'success' ? 'bg-green-500/20 text-green-400' :
+                                        status === 'partial' ? 'bg-yellow-500/20 text-yellow-400' :
+                                        'bg-red-500/20 text-red-400'
+                                    }`}>{status}</span>
+                                )}
+                            </div>
+                            {results.map((r, i) => (
+                                <div key={`${r.vmid}-${i}`} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            {r.success
+                                                ? <Icons.CheckCircle className="w-4 h-4 text-green-400" />
+                                                : <Icons.XCircle className="w-4 h-4 text-red-400" />}
+                                            <span className="font-medium text-white">{r.vmid}</span>
+                                            {r.node && <span className="text-xs text-gray-500">{r.node}</span>}
+                                            {r.type && <span className="text-xs text-gray-600 uppercase">{r.type}</span>}
+                                            {typeof r.exit_code !== 'undefined' && (
+                                                <span className="text-xs text-gray-500">exit {r.exit_code}</span>
+                                            )}
+                                        </div>
+                                        <span className="text-xs text-gray-500">{r.timestamp ? fmtDate(r.timestamp) : ''}</span>
+                                    </div>
+                                    {r.stdout && (
+                                        <pre className="bg-proxmox-dark rounded-lg p-2 text-xs text-gray-300 whitespace-pre-wrap break-words max-h-64 overflow-y-auto">{r.stdout}</pre>
+                                    )}
+                                    {r.stderr && (
+                                        <pre className="bg-proxmox-dark rounded-lg p-2 text-xs text-red-400 whitespace-pre-wrap break-words max-h-64 overflow-y-auto mt-2">{r.stderr}</pre>
+                                    )}
+                                    {!r.stdout && !r.stderr && (
+                                        <p className="text-xs text-gray-600">{t('noOutput') || 'No output'}</p>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {showPasswordModal && (
+                        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowPasswordModal(false)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+                                <div className="flex items-center justify-between p-4 border-b border-proxmox-border">
+                                    <h3 className="text-lg font-semibold">{t('confirmExecute') || 'Confirm Execution'}</h3>
+                                    <button onClick={() => setShowPasswordModal(false)} className="p-1 hover:bg-proxmox-hover rounded">
+                                        <Icons.X className="w-5 h-5" />
+                                    </button>
+                                </div>
+                                <form className="p-4 space-y-4" onSubmit={(e) => {
+                                    e.preventDefault();
+                                    const password = e.target.password.value;
+                                    if (!password) return;
+                                    runCommand(password);
+                                }}>
+                                    <div className="bg-proxmox-dark rounded-lg p-3">
+                                        <p className="text-xs text-gray-500 mb-1">{t('command') || 'Command'}</p>
+                                        <pre className="text-sm text-gray-200 font-mono whitespace-pre-wrap break-words">{command}</pre>
+                                        <p className="text-xs text-gray-500 mt-2">{targets.length} {t('targetsSelected') || 'targets'}</p>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm text-gray-400 mb-1">{t('confirmPassword') || 'Confirm your password'} *</label>
+                                        <input
+                                            name="password"
+                                            type="password"
+                                            required
+                                            autoFocus
+                                            placeholder={t('enterPassword') || 'Enter your password'}
+                                            className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg"
+                                        />
+                                        <p className="text-xs text-gray-500 mt-1">{t('passwordRequiredForScripts') || 'Password confirmation required for security'}</p>
+                                    </div>
+                                    <div className="flex justify-end gap-3 pt-2">
+                                        <button type="button" onClick={() => setShowPasswordModal(false)} className="px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg hover:bg-proxmox-hover">
+                                            {t('cancel') || 'Cancel'}
+                                        </button>
+                                        <button type="submit" className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg flex items-center gap-2">
+                                            <Icons.Play className="w-4 h-4" />
+                                            {t('executeSelected') || 'Execute on Selected'}
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // MK May 2026 — Network Topology Visualization. Plain SVG, no D3 dep.
         // Three rows: cluster → nodes → bridges → VMs (grouped under bridge).
         function TopologyTab({ clusterId, authFetch, addToast, t }) {
@@ -16407,6 +16671,7 @@
                                                         { id: 'affinity', label: t('affinityRules') || 'Affinity', icon: Icons.Link },
                                                         { id: 'scripts', label: t('customScripts') || 'Scripts', icon: Icons.Terminal },
                                                         { id: 'clustercmd', label: t('clusterCommand') || 'Cluster Command', icon: Icons.Terminal },
+                                                        { id: 'vmcmd', label: t('vmCommand') || 'VM Command', icon: Icons.Terminal },
                                                         { id: 'snapshots', label: t('snapPoliciesTitle') || 'Snapshots', icon: Icons.Camera },
                                                         { id: 'replication', label: t('replicationOverview') || 'Replication', icon: Icons.RefreshCw },
                                                         { id: 'templates', label: t('templateLibrary') || 'Templates', icon: Icons.Package },
@@ -16834,6 +17099,17 @@
                                                 {automationSubTab === 'clustercmd' && (
                                                     <ClusterCommandTab
                                                         clusterId={selectedCluster?.id}
+                                                        authFetch={authFetch}
+                                                        addToast={addToast}
+                                                        t={t}
+                                                    />
+                                                )}
+
+                                                {/* VM Command — same idea, targeting guests instead of nodes */}
+                                                {automationSubTab === 'vmcmd' && (
+                                                    <VmCommandTab
+                                                        clusterId={selectedCluster?.id}
+                                                        resources={clusterResources}
                                                         authFetch={authFetch}
                                                         addToast={addToast}
                                                         t={t}
