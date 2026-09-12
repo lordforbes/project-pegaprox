@@ -2844,6 +2844,145 @@ def restore_deleted_script(cluster_id, script_id):
     return jsonify({'success': True, 'message': f"Script '{script['name']}' restored"})
 
 
+@bp.route('/api/clusters/<cluster_id>/execute', methods=['POST'])
+@require_auth(perms=['admin.scripts'])
+def execute_cluster_command(cluster_id):
+    """Run an ad-hoc shell command on cluster nodes in parallel - REQUIRES PASSWORD CONFIRMATION
+
+    Same threat model and guardrails as run_custom_script above (this IS
+    arbitrary remote code execution, just without saving the command as a
+    script row first): admin.scripts permission, password re-confirmation,
+    require_unconfined (this always targets whole nodes, never a single VM/
+    pool a confined caller could be scoped to), and full audit logging.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    data = request.json or {}
+    command = data.get('command')
+    password = data.get('password')
+
+    if not command or not isinstance(command, str) or not command.strip():
+        return jsonify({'error': 'Command is required'}), 400
+    command = command.strip()
+    if len(command) > 4000:
+        return jsonify({'error': 'Command too long (max 4000 chars)'}), 400
+
+    if not password:
+        return jsonify({'error': 'Password confirmation required to run commands'}), 401
+
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    users = load_users()
+    user_data = users.get(usr)
+    if not user_data:
+        return jsonify({'error': 'User not found'}), 401
+
+    mgr = cluster_managers[cluster_id]
+    cluster_name = mgr.config.name if hasattr(mgr, 'config') else cluster_id
+
+    stored_salt = user_data.get('password_salt', '')
+    stored_hash = user_data.get('password_hash', '')
+    if not stored_salt or not stored_hash or not verify_password(password, stored_salt, stored_hash):
+        log_audit(usr, 'cluster.execute_denied', 'Failed password verification for cluster command execution', cluster=cluster_name)
+        return jsonify({'error': 'Invalid password'}), 401
+
+    # Per-node timeout: caller can tune it but it's bounded to a sane window
+    # (spec calls for 5-10s) so one hung node can't tie up the request for long.
+    try:
+        node_timeout = float(data.get('timeout', 8))
+    except (TypeError, ValueError):
+        node_timeout = 8.0
+    node_timeout = max(1.0, min(node_timeout, 10.0))
+
+    # Target nodes - defaults to the whole cluster, or an explicit subset of it
+    requested_nodes = data.get('nodes')
+    all_nodes = []
+    try:
+        status_url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/status"
+        r = mgr._create_session().get(status_url, timeout=10)
+        if r.status_code == 200:
+            for item in r.json().get('data', []):
+                if item.get('type') == 'node':
+                    all_nodes.append(item.get('name'))
+    except Exception as e:
+        logging.error(f"Error getting cluster nodes: {e}")
+        return jsonify({'error': f'Could not get cluster nodes: {e}'}), 500
+
+    if requested_nodes:
+        if not isinstance(requested_nodes, list):
+            return jsonify({'error': 'nodes must be a list of node names'}), 400
+        nodes_to_run = [n for n in requested_nodes if n in all_nodes]
+    else:
+        nodes_to_run = all_nodes
+
+    if not nodes_to_run:
+        return jsonify({'error': 'No target nodes found'}), 404
+
+    log_audit(usr, 'cluster.execute_started',
+              f"Starting ad-hoc command on {len(nodes_to_run)} nodes ({', '.join(nodes_to_run)}): {command[:200]}",
+              cluster=cluster_name)
+
+    # NS Apr 2026 pattern (see run_custom_script) — bounded-parallel fan-out via
+    # run_per_node so one dead/slow node can't block the others or the request.
+    def _exec_on_node(node):
+        started_at = datetime.now().isoformat()
+        node_ip = mgr._get_node_ip(node)
+        if not node_ip:
+            return {'node': node, 'ip': None, 'success': False, 'timestamp': started_at,
+                    'stdout': '', 'stderr': 'Could not determine SSH-reachable IP'}
+        try:
+            ssh = mgr._ssh_connect(node_ip)
+            if not ssh:
+                return {'node': node, 'ip': node_ip, 'success': False, 'timestamp': started_at,
+                        'stdout': '', 'stderr': 'SSH connection failed'}
+            try:
+                stdin, stdout, stderr = ssh.exec_command(command, timeout=node_timeout)
+                out = stdout.read().decode('utf-8', errors='replace')[:20000]
+                errout = stderr.read().decode('utf-8', errors='replace')[:20000]
+                rc = stdout.channel.recv_exit_status()
+            finally:
+                ssh.close()
+            return {'node': node, 'ip': node_ip, 'success': rc == 0, 'exit_code': rc,
+                    'timestamp': started_at, 'stdout': out, 'stderr': errout}
+        except Exception as e:
+            return {'node': node, 'ip': node_ip, 'success': False, 'timestamp': started_at,
+                    'stdout': '', 'stderr': str(e)}
+
+    from pegaprox.utils.concurrent import run_per_node
+    raw = run_per_node(
+        {n: _exec_on_node for n in nodes_to_run},
+        max_concurrent=8,
+        timeout=node_timeout + 5,
+    )
+
+    results = []
+    for node in nodes_to_run:
+        r = raw.get(node) or {'node': node, 'ip': None, 'success': False,
+                               'timestamp': datetime.now().isoformat(),
+                               'stdout': '', 'stderr': 'Timed out or no result'}
+        results.append(r)
+
+    success_count = sum(1 for r in results if r['success'])
+    status = 'success' if success_count == len(nodes_to_run) else ('partial' if success_count > 0 else 'failed')
+
+    log_audit(usr, 'cluster.executed',
+              f"Ad-hoc command completed: {success_count}/{len(nodes_to_run)} nodes succeeded ({status}): {command[:200]}",
+              cluster=cluster_name)
+
+    return jsonify({
+        'success': success_count == len(nodes_to_run),
+        'status': status,
+        'message': f'Ran on {success_count}/{len(nodes_to_run)} nodes',
+        'results': results
+    })
+
+
 # ──────────────────────────────────────────
 # XCP-ng specific: PIFs, bonds, guest metrics, pool HA
 # ──────────────────────────────────────────

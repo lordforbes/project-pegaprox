@@ -3500,6 +3500,163 @@
             );
         }
 
+        // Cluster Command — run an ad-hoc shell command on some/all nodes of a cluster
+        // in parallel over SSH. Same admin.scripts + password-confirmation guardrails as
+        // the Automation > Scripts tab (see backend execute_cluster_command), just without
+        // saving the command as a script first.
+        function ClusterCommandTab({ clusterId, authFetch, addToast, t }) {
+            const [command, setCommand] = React.useState('');
+            const [running, setRunning] = React.useState(false);
+            const [results, setResults] = React.useState(null);
+            const [status, setStatus] = React.useState(null);
+            const [showPasswordModal, setShowPasswordModal] = React.useState(false);
+
+            const runCommand = async (password) => {
+                setRunning(true);
+                setShowPasswordModal(false);
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/execute`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ command, password }),
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (res && res.ok) {
+                        setResults(data.results || []);
+                        setStatus(data.status || null);
+                        addToast(data.message || (t('commandExecuted') || 'Command executed'), data.success ? 'success' : 'warning');
+                    } else {
+                        addToast(data.error || (t('commandFailed') || 'Failed to execute command'), 'error');
+                    }
+                } catch (e) {
+                    addToast('Error: ' + e.message, 'error');
+                } finally {
+                    setRunning(false);
+                }
+            };
+
+            return (
+                <div className="space-y-4">
+                    <p className="text-sm text-gray-400">
+                        {t('clusterCommandDesc') || 'Run a one-off shell command on every node in this cluster over SSH and see each result.'}
+                    </p>
+
+                    <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-yellow-300 text-sm flex items-start gap-2">
+                        <Icons.AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                        <span>{t('clusterCommandWarning') || 'This runs with SSH user permissions on every targeted node. Double-check the command before running it.'}</span>
+                    </div>
+
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3">
+                        <label className="block text-sm text-gray-400">{t('command') || 'Command'}</label>
+                        <textarea
+                            value={command}
+                            onChange={(e) => setCommand(e.target.value)}
+                            rows={4}
+                            placeholder="uptime"
+                            spellCheck={false}
+                            className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg font-mono text-sm text-gray-200"
+                        />
+                        <div className="flex justify-end">
+                            <button
+                                onClick={() => setShowPasswordModal(true)}
+                                disabled={!command.trim() || running}
+                                className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm"
+                            >
+                                {running ? <Icons.RefreshCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
+                                {running ? (t('running') || 'Running...') : (t('executeAllNodes') || 'Execute on All Nodes')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {results && (
+                        <div className="space-y-3">
+                            <div className="flex items-center justify-between">
+                                <h4 className="text-sm font-semibold text-gray-300">{t('results') || 'Results'}</h4>
+                                {status && (
+                                    <span className={`text-xs px-2 py-0.5 rounded-full ${
+                                        status === 'success' ? 'bg-green-500/20 text-green-400' :
+                                        status === 'partial' ? 'bg-yellow-500/20 text-yellow-400' :
+                                        'bg-red-500/20 text-red-400'
+                                    }`}>{status}</span>
+                                )}
+                            </div>
+                            {results.map((r) => (
+                                <div key={r.node} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            {r.success
+                                                ? <Icons.CheckCircle className="w-4 h-4 text-green-400" />
+                                                : <Icons.XCircle className="w-4 h-4 text-red-400" />}
+                                            <span className="font-medium text-white">{r.node}</span>
+                                            {r.ip && <span className="text-xs text-gray-500 font-mono">{r.ip}</span>}
+                                            {typeof r.exit_code !== 'undefined' && (
+                                                <span className="text-xs text-gray-500">exit {r.exit_code}</span>
+                                            )}
+                                        </div>
+                                        <span className="text-xs text-gray-500">{r.timestamp ? fmtDate(r.timestamp) : ''}</span>
+                                    </div>
+                                    {r.stdout && (
+                                        <pre className="bg-proxmox-dark rounded-lg p-2 text-xs text-gray-300 whitespace-pre-wrap break-words max-h-64 overflow-y-auto">{r.stdout}</pre>
+                                    )}
+                                    {r.stderr && (
+                                        <pre className="bg-proxmox-dark rounded-lg p-2 text-xs text-red-400 whitespace-pre-wrap break-words max-h-64 overflow-y-auto mt-2">{r.stderr}</pre>
+                                    )}
+                                    {!r.stdout && !r.stderr && (
+                                        <p className="text-xs text-gray-600">{t('noOutput') || 'No output'}</p>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {showPasswordModal && (
+                        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowPasswordModal(false)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+                                <div className="flex items-center justify-between p-4 border-b border-proxmox-border">
+                                    <h3 className="text-lg font-semibold">{t('confirmExecute') || 'Confirm Execution'}</h3>
+                                    <button onClick={() => setShowPasswordModal(false)} className="p-1 hover:bg-proxmox-hover rounded">
+                                        <Icons.X className="w-5 h-5" />
+                                    </button>
+                                </div>
+                                <form className="p-4 space-y-4" onSubmit={(e) => {
+                                    e.preventDefault();
+                                    const password = e.target.password.value;
+                                    if (!password) return;
+                                    runCommand(password);
+                                }}>
+                                    <div className="bg-proxmox-dark rounded-lg p-3">
+                                        <p className="text-xs text-gray-500 mb-1">{t('command') || 'Command'}</p>
+                                        <pre className="text-sm text-gray-200 font-mono whitespace-pre-wrap break-words">{command}</pre>
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm text-gray-400 mb-1">{t('confirmPassword') || 'Confirm your password'} *</label>
+                                        <input
+                                            name="password"
+                                            type="password"
+                                            required
+                                            autoFocus
+                                            placeholder={t('enterPassword') || 'Enter your password'}
+                                            className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg"
+                                        />
+                                        <p className="text-xs text-gray-500 mt-1">{t('passwordRequiredForScripts') || 'Password confirmation required for security'}</p>
+                                    </div>
+                                    <div className="flex justify-end gap-3 pt-2">
+                                        <button type="button" onClick={() => setShowPasswordModal(false)} className="px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg hover:bg-proxmox-hover">
+                                            {t('cancel') || 'Cancel'}
+                                        </button>
+                                        <button type="submit" className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg flex items-center gap-2">
+                                            <Icons.Play className="w-4 h-4" />
+                                            {t('executeAllNodes') || 'Execute on All Nodes'}
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // MK May 2026 — Network Topology Visualization. Plain SVG, no D3 dep.
         // Three rows: cluster → nodes → bridges → VMs (grouped under bridge).
         function TopologyTab({ clusterId, authFetch, addToast, t }) {
@@ -16249,6 +16406,7 @@
                                                         { id: 'alerts', label: t('alerts') || 'Alerts', icon: Icons.Bell },
                                                         { id: 'affinity', label: t('affinityRules') || 'Affinity', icon: Icons.Link },
                                                         { id: 'scripts', label: t('customScripts') || 'Scripts', icon: Icons.Terminal },
+                                                        { id: 'clustercmd', label: t('clusterCommand') || 'Cluster Command', icon: Icons.Terminal },
                                                         { id: 'snapshots', label: t('snapPoliciesTitle') || 'Snapshots', icon: Icons.Camera },
                                                         { id: 'replication', label: t('replicationOverview') || 'Replication', icon: Icons.RefreshCw },
                                                         { id: 'templates', label: t('templateLibrary') || 'Templates', icon: Icons.Package },
@@ -16670,6 +16828,16 @@
                                                             </div>
                                                         </div>
                                                     </div>
+                                                )}
+
+                                                {/* Cluster Command — ad-hoc SSH exec on all nodes */}
+                                                {automationSubTab === 'clustercmd' && (
+                                                    <ClusterCommandTab
+                                                        clusterId={selectedCluster?.id}
+                                                        authFetch={authFetch}
+                                                        addToast={addToast}
+                                                        t={t}
+                                                    />
                                                 )}
 
                                                 {/* NS May 2026 — Snapshot Schedules sub-tab */}
